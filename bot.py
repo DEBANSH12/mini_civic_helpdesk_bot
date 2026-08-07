@@ -40,7 +40,6 @@ THEMES = {
 T = THEMES[st.session_state["theme"]]
 ACCENT = "#00D1B2"
 
-
 # ---------------- Background image ----------------
 def get_base64_image(path):
     try:
@@ -48,7 +47,6 @@ def get_base64_image(path):
             return base64.b64encode(f.read()).decode()
     except FileNotFoundError:
         return None
-
 
 bg_image = get_base64_image("background.png")
 
@@ -66,10 +64,6 @@ else:
 
 st.markdown(f"""
 <style>
-    /* Hides the top header bar (GitHub link, Share, Menu) and footer */
-    [data-testid="stHeader"] {{ display: none !important; }}
-    footer {{ display: none !important; }}
-
     .stApp {{ {background_css} }}
     .block-container {{
         margin-left: 22% !important;
@@ -87,6 +81,11 @@ st.markdown(f"""
     .emergency-card {{
         background: linear-gradient(135deg, rgba(139,26,26,0.45) 0%, {T['card_bg']} 100%);
         border: 1px solid #7A2E2E; border-radius: 14px; padding: 20px; margin-bottom: 16px;
+        backdrop-filter: blur(8px);
+    }}
+    .cyber-card {{
+        background: linear-gradient(135deg, rgba(30,58,95,0.55) 0%, {T['card_bg']} 100%);
+        border: 1px solid #2E5A7A; border-radius: 14px; padding: 20px; margin-bottom: 16px;
         backdrop-filter: blur(8px);
     }}
     div[data-testid="stVerticalBlockBorderWrapper"] {{
@@ -108,6 +107,11 @@ st.markdown(f"""
         border: 1px solid #FF6B6B !important;
     }}
     .emergency-btn button:hover {{ background-color: #9C3838 !important; }}
+    .cyber-btn button {{
+        background-color: #1E3A5F !important; color: #FFFFFF !important;
+        border: 1px solid #4A90D9 !important;
+    }}
+    .cyber-btn button:hover {{ background-color: #2A4E7A !important; }}
     .danger-btn button {{
         background-color: #7A2E2E !important; color: #FFFFFF !important;
         border: 1px solid #FF6B6B !important; width: auto !important; padding: 6px 16px !important;
@@ -122,6 +126,7 @@ st.markdown(f"""
         background-color: {T['card_bg_light']}; border: 1px solid {T['border']}; border-radius: 10px;
         padding: 12px 14px; margin-bottom: 8px; display: flex; align-items: center; gap: 10px;
     }}
+    .theme-toggle-row {{ display: flex; justify-content: flex-end; margin-bottom: 6px; }}
 
     @media (max-width: 768px) {{
         .block-container {{
@@ -134,11 +139,160 @@ st.markdown(f"""
         .hero {{ padding: 24px 18px; }}
         .hero h1 {{ font-size: 22px !important; }}
         .hero p {{ font-size: 13px !important; }}
-        .emergency-card p:first-child {{ font-size: 16px !important; }}
+        .emergency-card p:first-child, .cyber-card p:first-child {{ font-size: 16px !important; }}
     }}
 </style>
 """, unsafe_allow_html=True)
 
+# ---------------- Top control row: theme toggle ----------------
+top_spacer, top_toggle_col = st.columns([5, 1.4])
+with top_toggle_col:
+    is_light = st.toggle("☀️ Light" if st.session_state["theme"] == "dark" else "☀️ Light",
+                          value=(st.session_state["theme"] == "light"), key="theme_switch")
+    new_theme = "light" if is_light else "dark"
+    if new_theme != st.session_state["theme"]:
+        st.session_state["theme"] = new_theme
+        st.rerun()
+
+st.markdown(f"""
+<div class="hero">
+    <h1>🏙️ Civic Helpdesk Bot</h1>
+    <p>Report civic issues in any language — powered by Sarvam AI</p>
+</div>
+""", unsafe_allow_html=True)
+
+load_dotenv()
+client = SarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
+
+LANGUAGES = {
+    "Hindi": "hi-IN", "Bengali": "bn-IN", "Gujarati": "gu-IN", "Kannada": "kn-IN",
+    "Malayalam": "ml-IN", "Marathi": "mr-IN", "Odia": "od-IN", "Punjabi": "pa-IN",
+    "Tamil": "ta-IN", "Telugu": "te-IN", "English": "en-IN",
+}
+
+# ---------------- Persistent storage (with migration) ----------------
+DB_PATH = "complaints.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS complaints (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticket_id TEXT, category TEXT, description TEXT,
+        timestamp TEXT, feedback TEXT
+    )""")
+    for col_def in ["original_query TEXT", "ai_response TEXT", "translated_response TEXT", "language TEXT"]:
+        try:
+            conn.execute(f"ALTER TABLE complaints ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def log_complaint(category, description, original_query):
+    ticket_id = f"TICKET-{random.randint(1000,9999)}"
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO complaints
+           (ticket_id, category, description, timestamp, feedback, original_query)
+           VALUES (?,?,?,?,?,?)""",
+        (ticket_id, category, description, datetime.now().strftime("%Y-%m-%d %H:%M"), None, original_query),
+    )
+    conn.commit()
+    conn.close()
+    return {"ticket_id": ticket_id, "category": category}
+
+def update_complaint_response(ticket_id, ai_response, translated_response, language):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE complaints SET ai_response=?, translated_response=?, language=? WHERE ticket_id=?",
+        (ai_response, translated_response, language, ticket_id),
+    )
+    conn.commit()
+    conn.close()
+
+def get_recent_complaints(limit=5):
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT ticket_id, category, description, timestamp FROM complaints ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def get_all_complaints(search_term=""):
+    conn = sqlite3.connect(DB_PATH)
+    if search_term:
+        like = f"%{search_term}%"
+        rows = conn.execute(
+            """SELECT ticket_id, category, description, timestamp, feedback,
+                      original_query, ai_response, translated_response, language
+               FROM complaints
+               WHERE ticket_id LIKE ? OR category LIKE ? OR description LIKE ?
+               ORDER BY id DESC""",
+            (like, like, like),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT ticket_id, category, description, timestamp, feedback,
+                      original_query, ai_response, translated_response, language
+               FROM complaints ORDER BY id DESC"""
+        ).fetchall()
+    conn.close()
+    return rows
+
+def save_feedback(ticket_id, feedback):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE complaints SET feedback=? WHERE ticket_id=?", (feedback, ticket_id))
+    conn.commit()
+    conn.close()
+
+def delete_complaint(ticket_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM complaints WHERE ticket_id=?", (ticket_id,))
+    conn.commit()
+    conn.close()
+
+# ---------------- Retry + caching ----------------
+def call_with_retry(fn, *args, max_retries=3, base_delay=1.0, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except (httpx.ConnectTimeout, httpx.ReadTimeout):
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt))
+
+@st.cache_data(show_spinner=False)
+def translate_cached(text, target_lang_code):
+    translated = call_with_retry(
+        client.text.translate, input=text, source_language_code="en-IN",
+        target_language_code=target_lang_code, speaker_gender="Male",
+    )
+    return translated.translated_text
+
+# ---------------- IP-based location ----------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_location_by_ip(ip_address):
+    try:
+        url = f"http://ip-api.com/json/{ip_address}" if ip_address else "http://ip-api.com/json/"
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") == "success":
+            return {
+                "city": data.get("city", ""), "region": data.get("regionName", ""),
+                "lat": data.get("lat"), "lon": data.get("lon"),
+            }
+    except Exception:
+        pass
+    return None
+
+def maps_link(lat, lon, query):
+    return f"https://www.google.com/maps/search/{query}/@{lat},{lon},15z"
+
+def maps_link_by_name(place_query):
+    return f"https://www.google.com/maps/search/{place_query.replace(' ', '+')}"
 
 # ---------------- NEW: Local health & civic news (Google News RSS, no key needed) ----------------
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -161,233 +315,6 @@ def get_local_news(city):
     except Exception:
         return []
 
-
-# ---------------- News Dialog Popup ----------------
-@st.dialog("📰 Local Health & Civic News")
-def show_news_dialog(city):
-    with st.spinner("Fetching latest news..."):
-        news_items = get_local_news(city)
-
-    if news_items:
-        for item in news_items:
-            st.markdown(f"""
-            <div class="news-card">
-                <div style="font-size:28px;">{item['icon']}</div>
-                <div style="flex:1;">
-                    <p style="margin:0; font-weight:600; font-size:14px;">{item['title']}</p>
-                    <p style="margin:0; font-size:12px; color:{T['muted']};">{item['source']}</p>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            st.link_button(f"Read full story", item["link"], key=f"news_{item['link'][:50]}")
-    else:
-        st.caption("Couldn't load news right now — try again shortly.")
-
-
-# ---------------- Top Navigation Menu ----------------
-top_spacer, menu_col = st.columns([6, 2])
-
-with menu_col:
-    # This creates an interactive dropdown button in the top right
-    with st.popover("☰ Menu & Tools", use_container_width=True):
-
-        # 1. Theme Toggle
-        st.markdown("**🎨 Appearance**")
-        is_light = st.toggle("☀️ Light Theme",
-                             value=(st.session_state["theme"] == "light"), key="theme_switch")
-        new_theme = "light" if is_light else "dark"
-        if new_theme != st.session_state["theme"]:
-            st.session_state["theme"] = new_theme
-            st.rerun()
-
-        st.divider()
-
-        # 2. Cybersecurity Quick Links
-        st.markdown("**🛡️ Cybercrime Help**")
-        st.caption("Official cybersecurity channels.")
-        st.markdown("📞 **1930** (Helpline)")
-        st.link_button("🌐 cybercrime.gov.in", "https://www.cybercrime.gov.in", use_container_width=True)
-        st.link_button("🖥️ CERT-In", "https://www.cert-in.org.in", use_container_width=True)
-
-        st.divider()
-
-        # 3. Local News Trigger
-        st.markdown("**📰 Local News**")
-        news_city_input = st.text_input("City for news (optional):", placeholder="e.g. Delhi")
-        if st.button("Fetch Latest News", use_container_width=True):
-            show_news_dialog(news_city_input)
-
-# ---------------- Hero Section ----------------
-st.markdown(f"""
-<div class="hero">
-    <h1>🏙️ Civic Helpdesk Bot</h1>
-    <p>Report civic issues in any language — powered by Sarvam AI</p>
-</div>
-""", unsafe_allow_html=True)
-
-load_dotenv()
-client = SarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
-
-LANGUAGES = {
-    "Hindi": "hi-IN", "Bengali": "bn-IN", "Gujarati": "gu-IN", "Kannada": "kn-IN",
-    "Malayalam": "ml-IN", "Marathi": "mr-IN", "Odia": "od-IN", "Punjabi": "pa-IN",
-    "Tamil": "ta-IN", "Telugu": "te-IN", "English": "en-IN",
-}
-
-# ---------------- Persistent storage (with migration) ----------------
-DB_PATH = "complaints.db"
-
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS complaints
-                    (
-                        id
-                        INTEGER
-                        PRIMARY
-                        KEY
-                        AUTOINCREMENT,
-                        ticket_id
-                        TEXT,
-                        category
-                        TEXT,
-                        description
-                        TEXT,
-                        timestamp
-                        TEXT,
-                        feedback
-                        TEXT
-                    )""")
-    for col_def in ["original_query TEXT", "ai_response TEXT", "translated_response TEXT", "language TEXT"]:
-        try:
-            conn.execute(f"ALTER TABLE complaints ADD COLUMN {col_def}")
-        except sqlite3.OperationalError:
-            pass
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
-
-def log_complaint(category, description, original_query):
-    ticket_id = f"TICKET-{random.randint(1000, 9999)}"
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """INSERT INTO complaints
-               (ticket_id, category, description, timestamp, feedback, original_query)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (ticket_id, category, description, datetime.now().strftime("%Y-%m-%d %H:%M"), None, original_query),
-    )
-    conn.commit()
-    conn.close()
-    return {"ticket_id": ticket_id, "category": category}
-
-
-def update_complaint_response(ticket_id, ai_response, translated_response, language):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "UPDATE complaints SET ai_response=?, translated_response=?, language=? WHERE ticket_id=?",
-        (ai_response, translated_response, language, ticket_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_recent_complaints(limit=5):
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT ticket_id, category, description, timestamp FROM complaints ORDER BY id DESC LIMIT ?", (limit,)
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def get_all_complaints(search_term=""):
-    conn = sqlite3.connect(DB_PATH)
-    if search_term:
-        like = f"%{search_term}%"
-        rows = conn.execute(
-            """SELECT ticket_id,
-                      category,
-                      description, timestamp, feedback, original_query, ai_response, translated_response, language
-               FROM complaints
-               WHERE ticket_id LIKE ? OR category LIKE ? OR description LIKE ?
-               ORDER BY id DESC""",
-            (like, like, like),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """SELECT ticket_id,
-                      category,
-                      description, timestamp, feedback, original_query, ai_response, translated_response, language
-               FROM complaints
-               ORDER BY id DESC"""
-        ).fetchall()
-    conn.close()
-    return rows
-
-
-def save_feedback(ticket_id, feedback):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE complaints SET feedback=? WHERE ticket_id=?", (feedback, ticket_id))
-    conn.commit()
-    conn.close()
-
-
-def delete_complaint(ticket_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("DELETE FROM complaints WHERE ticket_id=?", (ticket_id,))
-    conn.commit()
-    conn.close()
-
-
-# ---------------- Retry + caching ----------------
-def call_with_retry(fn, *args, max_retries=3, base_delay=1.0, **kwargs):
-    for attempt in range(max_retries):
-        try:
-            return fn(*args, **kwargs)
-        except (httpx.ConnectTimeout, httpx.ReadTimeout):
-            if attempt == max_retries - 1:
-                raise
-            time.sleep(base_delay * (2 ** attempt))
-
-
-@st.cache_data(show_spinner=False)
-def translate_cached(text, target_lang_code):
-    translated = call_with_retry(
-        client.text.translate, input=text, source_language_code="en-IN",
-        target_language_code=target_lang_code, speaker_gender="Male",
-    )
-    return translated.translated_text
-
-
-# ---------------- IP-based location ----------------
-@st.cache_data(show_spinner=False, ttl=3600)
-def get_location_by_ip(ip_address):
-    try:
-        url = f"http://ip-api.com/json/{ip_address}" if ip_address else "http://ip-api.com/json/"
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("status") == "success":
-            return {
-                "city": data.get("city", ""), "region": data.get("regionName", ""),
-                "lat": data.get("lat"), "lon": data.get("lon"),
-            }
-    except Exception:
-        pass
-    return None
-
-
-def maps_link(lat, lon, query):
-    return f"https://www.google.com/maps/search/{query}/@{lat},{lon},15z"
-
-
-def maps_link_by_name(place_query):
-    return f"https://www.google.com/maps/search/{place_query.replace(' ', '+')}"
-
-
 tools = [{
     "type": "function",
     "function": {
@@ -404,11 +331,9 @@ tools = [{
     },
 }]
 
-
 def handle_complaint(user_text, target_lang_code, lang_name):
     messages = [
-        {"role": "system",
-         "content": "You are a civic helpdesk assistant. Always classify and log every complaint using the log_complaint tool before replying."},
+        {"role": "system", "content": "You are a civic helpdesk assistant. Always classify and log every complaint using the log_complaint tool before replying."},
         {"role": "user", "content": user_text},
     ]
 
@@ -447,7 +372,6 @@ def handle_complaint(user_text, target_lang_code, lang_name):
     else:
         return None, message.content, None
 
-
 # ---------------- Emergency Help section ----------------
 st.markdown("""
 <div class="emergency-card">
@@ -477,10 +401,8 @@ if st.session_state.get("show_emergency"):
         detected_city = location_data["city"]
         st.success(f"📍 Estimated location: {location_data['city']}, {location_data['region']}")
         lat, lon = location_data["lat"], location_data["lon"]
-        hospital_link = maps_link(lat, lon, "hospital") if lat else maps_link_by_name(
-            f"hospital near {location_data['city']}")
-        police_link = maps_link(lat, lon, "police+station") if lat else maps_link_by_name(
-            f"police station near {location_data['city']}")
+        hospital_link = maps_link(lat, lon, "hospital") if lat else maps_link_by_name(f"hospital near {location_data['city']}")
+        police_link = maps_link(lat, lon, "police+station") if lat else maps_link_by_name(f"police station near {location_data['city']}")
     else:
         st.info("Couldn't auto-detect your area. Enter your city for accurate map links.")
         manual_city = st.text_input("Your city:", key="manual_city_input")
@@ -505,6 +427,66 @@ if st.session_state.get("show_emergency"):
             st.link_button("🏥 Nearest hospital", hospital_link)
         with col2:
             st.link_button("👮 Nearest police station", police_link)
+
+st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+
+# ---------------- NEW: Cybersecurity contact section ----------------
+st.markdown("""
+<div class="cyber-card">
+    <p style="font-weight:700; font-size:18px; margin-bottom:4px;">🛡️ Report a Cybercrime</p>
+    <p style="font-size:14px; margin-bottom:0;">
+        Fraud, hacking, online harassment, or data theft? Contact India's official cybersecurity channels.
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="cyber-btn">', unsafe_allow_html=True)
+cyber_clicked = st.button("🛡️ Show Cybersecurity Contacts", key="cyber_check")
+st.markdown('</div>', unsafe_allow_html=True)
+
+if cyber_clicked:
+    st.session_state["show_cyber"] = not st.session_state.get("show_cyber", False)
+
+if st.session_state.get("show_cyber"):
+    st.markdown("""
+    <div style="background-color:rgba(30,58,95,0.15); padding:18px; border-radius:12px; border:1px solid #2E5A7A; margin-top:8px;">
+        <p style="font-weight:600; margin-bottom:8px; color:#6FB3E0;">Official Cybersecurity Contacts (India)</p>
+        <p>📞 <strong>1930</strong> — National Cyber Crime Helpline</p>
+        <p>🌐 <strong>cybercrime.gov.in</strong> — National Cyber Crime Reporting Portal</p>
+        <p>🖥️ <strong>cert-in.org.in</strong> — CERT-In (Indian Computer Emergency Response Team)</p>
+    </div>
+    """, unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.link_button("🌐 Report on cybercrime.gov.in", "https://www.cybercrime.gov.in")
+    with col2:
+        st.link_button("🖥️ Visit CERT-In", "https://www.cert-in.org.in")
+
+st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+
+# ---------------- NEW: Local health & civic news dropdown ----------------
+with st.expander("📰 Local Health & Civic News", expanded=False):
+    news_city = detected_city or st.session_state.get("news_city_override")
+    if not news_city:
+        news_city = st.text_input("City for news (leave blank for general India news):", key="news_city_override")
+
+    with st.spinner("Fetching latest news..."):
+        news_items = get_local_news(news_city)
+
+    if news_items:
+        for item in news_items:
+            st.markdown(f"""
+            <div class="news-card">
+                <div style="font-size:28px;">{item['icon']}</div>
+                <div style="flex:1;">
+                    <p style="margin:0; font-weight:600; font-size:14px;">{item['title']}</p>
+                    <p style="margin:0; font-size:12px; color:{T['muted']};">{item['source']}</p>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.link_button(f"Read: {item['title'][:40]}{'...' if len(item['title']) > 40 else ''}", item["link"], key=f"news_{item['link'][:50]}")
+    else:
+        st.caption("Couldn't load news right now — try again shortly.")
 
 st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
 
