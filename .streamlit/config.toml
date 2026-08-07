@@ -6,4 +6,4 @@ textColor="#FAFAFA"
 font="sans serif"
 
 [client]
-toolbarMode = "viewer"
+toolbarMode = "off"
