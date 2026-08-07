@@ -72,8 +72,11 @@ st.markdown(f"""
     .emergency-btn button:hover {{ background-color: #9C3838 !important; }}
     div[data-testid="stMarkdownContainer"] p {{ font-size: 16px; line-height: 1.6; }}
     label[data-testid="stWidgetLabel"] p {{ color: #E5E9F0 !important; font-weight: 500; }}
+    div[data-testid="stExpander"] {{
+        background-color: rgba(28,35,51,0.85); border-radius: 10px; border: 1px solid #2A3550;
+        margin-bottom: 8px;
+    }}
 
-    /* ---- Mobile responsiveness ---- */
     @media (max-width: 768px) {{
         .block-container {{
             margin-left: 4% !important;
@@ -104,7 +107,7 @@ LANGUAGES = {
     "Tamil": "ta-IN", "Telugu": "te-IN", "English": "en-IN",
 }
 
-# ---------------- Persistent storage ----------------
+# ---------------- Persistent storage (with migration for existing DBs) ----------------
 DB_PATH = "complaints.db"
 
 def init_db():
@@ -114,21 +117,43 @@ def init_db():
         ticket_id TEXT, category TEXT, description TEXT,
         timestamp TEXT, feedback TEXT
     )""")
+    # Migrate: add new columns if this DB predates them
+    for col_def in [
+        "original_query TEXT",
+        "ai_response TEXT",
+        "translated_response TEXT",
+        "language TEXT",
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE complaints ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
     conn.close()
 
 init_db()
 
-def log_complaint(category, description):
+def log_complaint(category, description, original_query):
     ticket_id = f"TICKET-{random.randint(1000,9999)}"
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO complaints (ticket_id, category, description, timestamp, feedback) VALUES (?,?,?,?,?)",
-        (ticket_id, category, description, datetime.now().strftime("%Y-%m-%d %H:%M"), None),
+        """INSERT INTO complaints
+           (ticket_id, category, description, timestamp, feedback, original_query)
+           VALUES (?,?,?,?,?,?)""",
+        (ticket_id, category, description, datetime.now().strftime("%Y-%m-%d %H:%M"), None, original_query),
     )
     conn.commit()
     conn.close()
     return {"ticket_id": ticket_id, "category": category}
+
+def update_complaint_response(ticket_id, ai_response, translated_response, language):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE complaints SET ai_response=?, translated_response=?, language=? WHERE ticket_id=?",
+        (ai_response, translated_response, language, ticket_id),
+    )
+    conn.commit()
+    conn.close()
 
 def get_recent_complaints(limit=5):
     conn = sqlite3.connect(DB_PATH)
@@ -143,14 +168,18 @@ def get_all_complaints(search_term=""):
     if search_term:
         like = f"%{search_term}%"
         rows = conn.execute(
-            """SELECT ticket_id, category, description, timestamp, feedback FROM complaints
+            """SELECT ticket_id, category, description, timestamp, feedback,
+                      original_query, ai_response, translated_response, language
+               FROM complaints
                WHERE ticket_id LIKE ? OR category LIKE ? OR description LIKE ?
                ORDER BY id DESC""",
             (like, like, like),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT ticket_id, category, description, timestamp, feedback FROM complaints ORDER BY id DESC"
+            """SELECT ticket_id, category, description, timestamp, feedback,
+                      original_query, ai_response, translated_response, language
+               FROM complaints ORDER BY id DESC"""
         ).fetchall()
     conn.close()
     return rows
@@ -179,7 +208,7 @@ def translate_cached(text, target_lang_code):
     )
     return translated.translated_text
 
-# ---------------- IP-based location (no iframe, no permission prompt needed) ----------------
+# ---------------- IP-based location ----------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_location_by_ip(ip_address):
     try:
@@ -220,7 +249,7 @@ tools = [{
     },
 }]
 
-def handle_complaint(user_text, target_lang_code):
+def handle_complaint(user_text, target_lang_code, lang_name):
     messages = [
         {"role": "system", "content": "You are a civic helpdesk assistant. Always classify and log every complaint using the log_complaint tool before replying."},
         {"role": "user", "content": user_text},
@@ -238,7 +267,7 @@ def handle_complaint(user_text, target_lang_code):
     if message.tool_calls:
         tool_call = message.tool_calls[0]
         args = json.loads(tool_call.function.arguments)
-        result = log_complaint(args["category"], args["description"])
+        result = log_complaint(args["category"], args["description"], user_text)
 
         messages.append({
             "role": "assistant",
@@ -252,10 +281,11 @@ def handle_complaint(user_text, target_lang_code):
         final = call_with_retry(client.chat.completions, model="sarvam-105b", messages=messages, tools=tools)
         final_text = final.choices[0].message.content
 
-        if target_lang_code == "en-IN":
-            return result, final_text, None
+        translated_text = None
+        if target_lang_code != "en-IN":
+            translated_text = translate_cached(final_text, target_lang_code)
 
-        translated_text = translate_cached(final_text, target_lang_code)
+        update_complaint_response(result["ticket_id"], final_text, translated_text, lang_name)
         return result, final_text, translated_text
     else:
         return None, message.content, None
@@ -314,22 +344,30 @@ if st.session_state.get("show_emergency"):
 
 st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
 
-# ---------------- NEW: Browse all tickets ----------------
-with st.expander("📂 Browse All Logged Tickets", expanded=False):
+# ---------------- Browse all tickets — click to view full detail ----------------
+browse_toggle = st.button("📂 Browse All Logged Tickets", key="browse_toggle")
+if browse_toggle:
+    st.session_state["show_browse"] = not st.session_state.get("show_browse", False)
+
+if st.session_state.get("show_browse"):
     search_term = st.text_input("Search by ticket ID, category, or keyword:", key="ticket_search")
     all_tickets = get_all_complaints(search_term)
 
     if all_tickets:
-        st.caption(f"{len(all_tickets)} ticket(s) found")
-        for tid, cat, desc, ts, feedback in all_tickets:
+        st.caption(f"{len(all_tickets)} ticket(s) found — click any to view full details")
+        for tid, cat, desc, ts, feedback, orig_query, ai_resp, trans_resp, lang in all_tickets:
             fb_icon = "👍" if feedback == "up" else "👎" if feedback == "down" else "—"
-            st.markdown(f"""
-            <div style="background-color:rgba(28,35,51,0.85); padding:14px 16px; border-radius:10px; border:1px solid #2A3550; margin-bottom:8px;">
-                <p style="margin:0; font-weight:600; color:#00D1B2;">{tid} <span style="color:#9CA3AF; font-weight:400;">· {cat}</span></p>
-                <p style="margin:4px 0 0 0; font-size:14px;">{desc}</p>
-                <p style="margin:6px 0 0 0; font-size:12px; color:#9CA3AF;">{ts} · Feedback: {fb_icon}</p>
-            </div>
-            """, unsafe_allow_html=True)
+            with st.expander(f"{tid} · {cat} · {ts}"):
+                st.markdown(f"**Category:** {cat}")
+                st.markdown(f"**Feedback:** {fb_icon}")
+                st.markdown("---")
+                st.markdown("**Original query:**")
+                st.markdown(orig_query if orig_query else "*Not recorded (logged before this feature was added)*")
+                st.markdown("**AI response:**")
+                st.markdown(ai_resp if ai_resp else "*Not recorded*")
+                if trans_resp:
+                    st.markdown(f"**Translated response ({lang}):**")
+                    st.markdown(trans_resp)
     else:
         st.caption("No tickets found.")
 
@@ -357,7 +395,7 @@ with st.container(border=True):
 
 if submitted and user_text:
     with st.spinner("Processing..."):
-        ticket, reply, translated_reply = handle_complaint(user_text, LANGUAGES[selected_lang])
+        ticket, reply, translated_reply = handle_complaint(user_text, LANGUAGES[selected_lang], selected_lang)
     st.session_state["last_result"] = (ticket, reply, translated_reply, selected_lang)
 
 if "last_result" in st.session_state:
