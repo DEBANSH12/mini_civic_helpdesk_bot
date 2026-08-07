@@ -5,7 +5,6 @@ from sarvamai import SarvamAI
 import streamlit as st
 import httpx
 import requests
-from streamlit_geolocation import streamlit_geolocation
 
 st.set_page_config(page_title="Civic Helpdesk Bot", page_icon="🏙️", layout="centered")
 
@@ -49,7 +48,7 @@ st.markdown(f"""
     .hero p {{ color: #C5CDDB; margin-top: 8px; font-size: 15px; }}
     .emergency-card {{
         background: linear-gradient(135deg, rgba(139,26,26,0.55) 0%, rgba(28,35,51,0.94) 100%);
-        border: 1px solid #7A2E2E; border-radius: 14px; padding: 20px; margin-bottom: 24px;
+        border: 1px solid #7A2E2E; border-radius: 14px; padding: 20px; margin-bottom: 16px;
         backdrop-filter: blur(8px);
     }}
     div[data-testid="stVerticalBlockBorderWrapper"] {{
@@ -63,10 +62,31 @@ st.markdown(f"""
     div[data-testid="stButton"] button {{
         border-radius: 10px; padding: 10px 28px; font-weight: 600;
         background-color: #00D1B2; color: #0E1117; border: none; transition: all 0.2s ease;
+        width: 100%;
     }}
     div[data-testid="stButton"] button:hover {{ background-color: #00E5C7; transform: translateY(-1px); }}
+    .emergency-btn button {{
+        background-color: #7A2E2E !important; color: #FFFFFF !important;
+        border: 1px solid #FF6B6B !important;
+    }}
+    .emergency-btn button:hover {{ background-color: #9C3838 !important; }}
     div[data-testid="stMarkdownContainer"] p {{ font-size: 16px; line-height: 1.6; }}
     label[data-testid="stWidgetLabel"] p {{ color: #E5E9F0 !important; font-weight: 500; }}
+
+    /* ---- Mobile responsiveness ---- */
+    @media (max-width: 768px) {{
+        .block-container {{
+            margin-left: 4% !important;
+            margin-right: 4% !important;
+            max-width: 100% !important;
+            padding-left: 0.8rem !important;
+            padding-right: 0.8rem !important;
+        }}
+        .hero {{ padding: 24px 18px; }}
+        .hero h1 {{ font-size: 22px !important; }}
+        .hero p {{ font-size: 13px !important; }}
+        .emergency-card p:first-child {{ font-size: 16px !important; }}
+    }}
 </style>
 
 <div class="hero">
@@ -118,6 +138,23 @@ def get_recent_complaints(limit=5):
     conn.close()
     return rows
 
+def get_all_complaints(search_term=""):
+    conn = sqlite3.connect(DB_PATH)
+    if search_term:
+        like = f"%{search_term}%"
+        rows = conn.execute(
+            """SELECT ticket_id, category, description, timestamp, feedback FROM complaints
+               WHERE ticket_id LIKE ? OR category LIKE ? OR description LIKE ?
+               ORDER BY id DESC""",
+            (like, like, like),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT ticket_id, category, description, timestamp, feedback FROM complaints ORDER BY id DESC"
+        ).fetchall()
+    conn.close()
+    return rows
+
 def save_feedback(ticket_id, feedback):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("UPDATE complaints SET feedback=? WHERE ticket_id=?", (feedback, ticket_id))
@@ -142,29 +179,30 @@ def translate_cached(text, target_lang_code):
     )
     return translated.translated_text
 
-# ---------------- Emergency location lookup ----------------
-@st.cache_data(show_spinner=False)
-def reverse_geocode(lat, lon):
+# ---------------- IP-based location (no iframe, no permission prompt needed) ----------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_location_by_ip(ip_address):
     try:
-        resp = requests.get(
-            "https://nominatim.openstreetmap.org/reverse",
-            params={"lat": lat, "lon": lon, "format": "json"},
-            headers={"User-Agent": "CivicHelpdeskBot/1.0 (student hackathon practice project)"},
-            timeout=5,
-        )
+        url = f"http://ip-api.com/json/{ip_address}" if ip_address else "http://ip-api.com/json/"
+        resp = requests.get(url, timeout=5)
         resp.raise_for_status()
         data = resp.json()
-        addr = data.get("address", {})
-        area = addr.get("suburb") or addr.get("neighbourhood") or addr.get("village") or ""
-        city = addr.get("city") or addr.get("town") or addr.get("county") or ""
-        state = addr.get("state", "")
-        parts = [p for p in [area, city, state] if p]
-        return ", ".join(parts) if parts else data.get("display_name", "Location detected")
+        if data.get("status") == "success":
+            return {
+                "city": data.get("city", ""),
+                "region": data.get("regionName", ""),
+                "lat": data.get("lat"),
+                "lon": data.get("lon"),
+            }
     except Exception:
-        return None
+        pass
+    return None
 
 def maps_link(lat, lon, query):
     return f"https://www.google.com/maps/search/{query}/@{lat},{lon},15z"
+
+def maps_link_by_name(place_query):
+    return f"https://www.google.com/maps/search/{place_query.replace(' ', '+')}"
 
 tools = [{
     "type": "function",
@@ -226,44 +264,74 @@ def handle_complaint(user_text, target_lang_code):
 st.markdown("""
 <div class="emergency-card">
     <p style="color:#FF6B6B; font-weight:700; font-size:18px; margin-bottom:4px;">🚨 Need Immediate Emergency Help?</p>
-    <p style="color:#C5CDDB; font-size:14px; margin-bottom:12px;">
-        This shares your live location to show nearby help and India's official emergency numbers.
-        It does not contact emergency services directly — for real emergencies, call <strong>112</strong> now.
+    <p style="color:#C5CDDB; font-size:14px; margin-bottom:0;">
+        Get your area and India's official emergency numbers instantly.
+        This does not contact emergency services directly — for real emergencies, call <strong>112</strong> now.
     </p>
 </div>
 """, unsafe_allow_html=True)
 
-with st.expander("📍 Share my location for local emergency info", expanded=False):
-    st.caption("Your browser will ask for location permission — this stays in your session and is never stored.")
-    location = streamlit_geolocation()
+st.markdown('<div class="emergency-btn">', unsafe_allow_html=True)
+emergency_clicked = st.button("📍 Check My Local Emergency Info", key="emergency_check")
+st.markdown('</div>', unsafe_allow_html=True)
 
-    if location and location.get("latitude"):
-        lat, lon = location["latitude"], location["longitude"]
-        place_name = reverse_geocode(lat, lon)
+if emergency_clicked:
+    st.session_state["show_emergency"] = True
 
-        if place_name:
-            st.success(f"📍 Detected location: {place_name}")
-        else:
-            st.warning("Got your coordinates, but couldn't resolve an address (network issue). Showing general info.")
+if st.session_state.get("show_emergency"):
+    with st.spinner("Locating your area..."):
+        client_ip = st.context.ip_address
+        location_data = get_location_by_ip(client_ip)
 
-        st.markdown(f"""
-        <div style="background-color:rgba(28,35,51,0.95); padding:18px; border-radius:12px; border:1px solid #2A3550; margin-top:8px;">
-            <p style="color:#00D1B2; font-weight:600; margin-bottom:8px;">National Emergency Numbers (India)</p>
-            <p>🚨 <strong>112</strong> — All-in-one emergency (police, fire, ambulance)</p>
-            <p>👮 <strong>100</strong> — Police</p>
-            <p>🚒 <strong>101</strong> — Fire</p>
-            <p>🚑 <strong>102 / 108</strong> — Ambulance</p>
-            <p>👩 <strong>1091</strong> — Women's helpline</p>
-        </div>
-        """, unsafe_allow_html=True)
+    if location_data and location_data.get("city"):
+        st.success(f"📍 Estimated location: {location_data['city']}, {location_data['region']}")
+        lat, lon = location_data["lat"], location_data["lon"]
+        hospital_link = maps_link(lat, lon, "hospital") if lat else maps_link_by_name(f"hospital near {location_data['city']}")
+        police_link = maps_link(lat, lon, "police+station") if lat else maps_link_by_name(f"police station near {location_data['city']}")
+    else:
+        st.info("Couldn't auto-detect your area. Enter your city for accurate map links.")
+        manual_city = st.text_input("Your city:", key="manual_city_input")
+        hospital_link = maps_link_by_name(f"hospital near {manual_city}") if manual_city else None
+        police_link = maps_link_by_name(f"police station near {manual_city}") if manual_city else None
 
+    st.markdown("""
+    <div style="background-color:rgba(28,35,51,0.95); padding:18px; border-radius:12px; border:1px solid #2A3550; margin-top:8px;">
+        <p style="color:#00D1B2; font-weight:600; margin-bottom:8px;">National Emergency Numbers (India)</p>
+        <p>🚨 <strong>112</strong> — All-in-one emergency (police, fire, ambulance)</p>
+        <p>👮 <strong>100</strong> — Police</p>
+        <p>🚒 <strong>101</strong> — Fire</p>
+        <p>🚑 <strong>102 / 108</strong> — Ambulance</p>
+        <p>👩 <strong>1091</strong> — Women's helpline</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if hospital_link and police_link:
         col1, col2 = st.columns(2)
         with col1:
-            st.link_button("🏥 Nearest hospital", maps_link(lat, lon, "hospital"))
+            st.link_button("🏥 Nearest hospital", hospital_link)
         with col2:
-            st.link_button("👮 Nearest police station", maps_link(lat, lon, "police+station"))
+            st.link_button("👮 Nearest police station", police_link)
+
+st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
+
+# ---------------- NEW: Browse all tickets ----------------
+with st.expander("📂 Browse All Logged Tickets", expanded=False):
+    search_term = st.text_input("Search by ticket ID, category, or keyword:", key="ticket_search")
+    all_tickets = get_all_complaints(search_term)
+
+    if all_tickets:
+        st.caption(f"{len(all_tickets)} ticket(s) found")
+        for tid, cat, desc, ts, feedback in all_tickets:
+            fb_icon = "👍" if feedback == "up" else "👎" if feedback == "down" else "—"
+            st.markdown(f"""
+            <div style="background-color:rgba(28,35,51,0.85); padding:14px 16px; border-radius:10px; border:1px solid #2A3550; margin-bottom:8px;">
+                <p style="margin:0; font-weight:600; color:#00D1B2;">{tid} <span style="color:#9CA3AF; font-weight:400;">· {cat}</span></p>
+                <p style="margin:4px 0 0 0; font-size:14px;">{desc}</p>
+                <p style="margin:6px 0 0 0; font-size:12px; color:#9CA3AF;">{ts} · Feedback: {fb_icon}</p>
+            </div>
+            """, unsafe_allow_html=True)
     else:
-        st.info("Click the location icon above to share your position and see local emergency info.")
+        st.caption("No tickets found.")
 
 # ---------------- Recent tickets sidebar ----------------
 with st.sidebar:
